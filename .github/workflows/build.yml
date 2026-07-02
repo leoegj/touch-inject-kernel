@@ -1,0 +1,83 @@
+name: Build touch_inject.ko
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flex bison bc libssl-dev python3
+
+      - name: Clone GKI kernel source
+        run: |
+          git clone --depth=1 -b android13-5.15 https://github.com/aosp-mirror/kernel_common kernel
+          cd kernel
+          # Show the kernel version
+          head -5 Makefile
+
+      - name: Copy module source into drivers/
+        run: |
+          mkdir -p kernel/drivers/touch_inject
+          cp touch_inject.c kernel/drivers/touch_inject/
+          cat > kernel/drivers/touch_inject/Kconfig << 'KEOF'
+          config TOUCH_INJECT
+              tristate "Touch injector for Xiaomi 13 (fuxi)"
+              depends on INPUT
+              help
+                Kernel module for FTS touch injection.
+          KEOF
+          cat > kernel/drivers/touch_inject/Makefile << 'MEOF'
+          obj-$(CONFIG_TOUCH_INJECT) := touch_inject.o
+          MEOF
+          # Add our driver to the parent Kconfig and Makefile
+          echo 'source "drivers/touch_inject/Kconfig"' >> kernel/drivers/Kconfig
+          echo 'obj-$(CONFIG_TOUCH_INJECT) += touch_inject/' >> kernel/drivers/Makefile
+
+      - name: Prepare kernel config
+        run: |
+          cd kernel
+          # Use GKI defconfig as base
+          make ARCH=arm64 gki_defconfig
+          # Enable our module
+          echo "CONFIG_TOUCH_INJECT=m" >> .config
+          # Enable CFI and LTO (required for GKI 5.15)
+          scripts/config -e CONFIG_LTO_CLANG
+          scripts/config -e CONFIG_CFI_CLANG
+          scripts/config -e CONFIG_CFI_CLANG_SHADOW
+          scripts/config -e CONFIG_SHADOW_CALL_STACK
+          # Disable module signature enforcement
+          scripts/config -d CONFIG_MODULE_SIG_FORCE
+          scripts/config -d CONFIG_MODULE_SIG_PROTECT
+          # Update config
+          make ARCH=arm64 olddefconfig 2>/dev/null || true
+          # Verify our module is enabled
+          grep TOUCH_INJECT .config
+
+      - name: Build kernel (headers + scripts)
+        run: |
+          cd kernel
+          make ARCH=arm64 LLVM=1 LLVM_IAS=0 -j$(nproc) prepare modules_prepare
+
+      - name: Build touch_inject.ko
+        run: |
+          cd kernel
+          make ARCH=arm64 LLVM=1 LLVM_IAS=0 M=drivers/touch_inject modules
+
+      - name: Show result
+        run: |
+          ls -lh kernel/drivers/touch_inject/touch_inject.ko
+          llvm-readelf -S kernel/drivers/touch_inject/touch_inject.ko | grep -E "gnu.linkonce|cfi|versions|text|modinfo"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: touch_inject
+          path: kernel/drivers/touch_inject/touch_inject.ko
