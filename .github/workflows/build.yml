@@ -15,7 +15,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: touch_inject
-          path: .github/touch_inject
+          path: touch_inject
 
   build:
     name: Build GKI module
