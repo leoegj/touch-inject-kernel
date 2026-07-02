@@ -14,7 +14,16 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y flex bison bc libssl-dev python3
+          sudo apt-get install -y flex bison bc libssl-dev python3 lld-14 clang-14 llvm-14
+          # Set up symlinks for LLVM=1 kernel build
+          sudo ln -sf /usr/bin/clang-14 /usr/local/bin/clang
+          sudo ln -sf /usr/bin/lld-14 /usr/local/bin/ld.lld
+          sudo ln -sf /usr/bin/llvm-ar-14 /usr/local/bin/llvm-ar
+          sudo ln -sf /usr/bin/llvm-nm-14 /usr/local/bin/llvm-nm
+          sudo ln -sf /usr/bin/llvm-objcopy-14 /usr/local/bin/llvm-objcopy
+          sudo ln -sf /usr/bin/llvm-objdump-14 /usr/local/bin/llvm-objdump
+          sudo ln -sf /usr/bin/llvm-readelf-14 /usr/local/bin/llvm-readelf
+          sudo ln -sf /usr/bin/llvm-strip-14 /usr/local/bin/llvm-strip
 
       - name: Clone GKI kernel source
         run: |
