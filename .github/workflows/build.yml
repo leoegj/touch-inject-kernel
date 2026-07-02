@@ -73,12 +73,12 @@ jobs:
       - name: Build kernel (headers + scripts)
         run: |
           cd kernel
-          make ARCH=arm64 LLVM=1 LLVM_IAS=0 -j$(nproc) prepare modules_prepare
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 -j$(nproc) prepare modules_prepare
 
       - name: Build touch_inject.ko
         run: |
           cd kernel
-          make ARCH=arm64 LLVM=1 LLVM_IAS=0 M=drivers/touch_inject modules
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 M=drivers/touch_inject modules
 
       - name: Show result
         run: |
