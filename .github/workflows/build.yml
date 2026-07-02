@@ -54,19 +54,17 @@ jobs:
         run: |
           cd kernel
           # Use GKI defconfig as base
-          make ARCH=arm64 gki_defconfig
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
           # Enable our module
           echo "CONFIG_TOUCH_INJECT=m" >> .config
-          # Enable CFI and LTO (required for GKI 5.15)
-          scripts/config -e CONFIG_LTO_CLANG
-          scripts/config -e CONFIG_CFI_CLANG
-          scripts/config -e CONFIG_CFI_CLANG_SHADOW
-          scripts/config -e CONFIG_SHADOW_CALL_STACK
-          # Disable module signature enforcement
-          scripts/config -d CONFIG_MODULE_SIG_FORCE
-          scripts/config -d CONFIG_MODULE_SIG_PROTECT
-          # Update config
-          make ARCH=arm64 olddefconfig 2>/dev/null || true
+          # Enable LTO and CFI (may already be set in GKI defconfig)
+          scripts/config -e CONFIG_LTO_CLANG 2>/dev/null || true
+          scripts/config -e CONFIG_LTO_CLANG_THIN 2>/dev/null || true
+          scripts/config -e CONFIG_CFI_CLANG 2>/dev/null || true
+          scripts/config -e CONFIG_CFI_CLANG_SHADOW 2>/dev/null || true
+          scripts/config -e CONFIG_SHADOW_CALL_STACK 2>/dev/null || true
+          # Update config with LLVM toolchain
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
           # Verify our module is enabled
           grep TOUCH_INJECT .config
 
