@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build kernel module
-        uses: feicong/android-kernel-build-action@v1.0.0
+        uses: feicong/android-kernel-build-action@main
         with:
           arch: aarch64
           tag: android13-5.15
