@@ -42,3 +42,9 @@ jobs:
           tag: android13-5.15
           module-name: touch_inject
           module-path: touch_inject
+
+      - name: Upload .ko only (lightweight)
+        uses: actions/upload-artifact@v4
+        with:
+          name: touch_inject.ko
+          path: ./output/*touch_inject*.ko
