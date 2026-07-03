@@ -1,27 +1,36 @@
 /*
- * touch_inject.c — FTS 触控注入内核模块
+ * touch_inject.c — FTS 触控注入内核模块 (拟人化增强版 v2.0)
  *
  * 目标: 小米13 (fuxi), GKI 5.15.178, STM FTS 触控IC
  *
  * 工作原理:
  *   1. 通过 input_handler 自动匹配名为 "fts" 的 input_dev
  *   2. 创建 /dev/touch_inject 字符设备
- *   3. 用户态 daemon write() 坐标数据 → 内核调用 input_event() 注入
+ *   3. 用户态 daemon write() 坐标数据 -> 内核调用 input_event() 注入
+ *
+ * v2.0 拟人化改进 (所有改进均在内核内部完成, 协议不变):
+ *   1. 高斯分布抖动 (CLT近似) 替代均匀分布 -- 坐标偏移更接近人类
+ *   2. AR(1) 时序相关抖动 -- 连续帧间抖动有记忆性, 非独立
+ *   3. TOUCH_MAJOR/MINOR 随机化 -- 模拟指腹接触面积变化
+ *   4. ABS_MT_PRESSURE 支持 -- hack补充absinfo, 上报压力值
+ *   5. 多帧压力渐变点击 -- 按下渐入->保持->抬起渐出, 非瞬变
+ *   6. 三次贝塞尔曲线滑动 -- 2个控制点, 比二次更自然
+ *   7. Smoothstep缓动 -- 三阶段运动模型(加速->匀速->减速)
+ *
+ * 协议格式 (全部 ASCII, 以换行结束) -- 与 v1.0 完全兼容:
+ *   T x y              -- tap (点击, 内部多帧压力渐变)
+ *   D x y              -- down (按下, 保持)
+ *   M x y              -- move (移动)
+ *   U                  -- up (抬起)
+ *   S x1 y1 x2 y2 ms   -- swipe (滑动, 三次贝塞尔+缓动)
+ *   W                  -- wait 0.5s
+ *
+ * 坐标映射: 屏幕 1080x2400 -> 触控 10800x24000 (x10)
+ *           本模块统一使用屏幕坐标, 内核自动 x10 转换
  *
  * 加载: su -c insmod touch_inject.ko
  * 测试: echo "T 540 1200" > /dev/touch_inject
  * 卸载: su -c rmmod touch_inject
- *
- * 坐标映射: 屏幕 1080x2400 → 触控 10800x24000 (×10)
- *           本模块统一使用屏幕坐标，内核自动 ×10 转换
- *
- * 协议格式 (全部 ASCII，以换行结束):
- *   T x y              — tap (点击)
- *   D                  — down (按下, 保持)
- *   M x y              — move (移动)
- *   U                  — up (抬起)
- *   S x1 y1 x2 y2 ms   — swipe (滑动)
- *   W                   — wait 0.5s
  */
 
 #include <linux/module.h>
@@ -37,12 +46,13 @@
 #include <linux/delay.h>
 #include <linux/ktime.h>
 #include <linux/mm.h>
+#include <linux/bitops.h>
 #include <generated/utsrelease.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("buddy");
-MODULE_DESCRIPTION("STM FTS touch injector for Xiaomi 13 (fuxi)");
-MODULE_VERSION("1.0");
+MODULE_DESCRIPTION("STM FTS touch injector for Xiaomi 13 (fuxi) - humanized v2.0");
+MODULE_VERSION("2.0");
 /* Manually set name and vermagic (normally added by modpost) */
 MODULE_INFO(name, "touch_inject");
 /* vermagic must match phone's kernel: 5.15.78 from existing modules */
@@ -52,7 +62,7 @@ MODULE_INFO(vermagic, "5.15.78 SMP preempt mod_unload modversions aarch64");
  * Configuration
  * ============================================================ */
 
-/* 屏幕坐标 → 触控坐标 缩放因子 */
+/* 屏幕坐标 -> 触控坐标 缩放因子 */
 #define X_SCALE 10
 #define Y_SCALE 10
 
@@ -70,6 +80,23 @@ MODULE_INFO(vermagic, "5.15.78 SMP preempt mod_unload modversions aarch64");
 /* 字符设备写缓冲区大小 */
 #define BUF_SIZE 256
 
+/* --- 拟人化参数 --- */
+
+/* 随机抖动范围 (像素, 高斯分布 sigma) */
+#define JITTER_RANGE 3
+
+/* 压力参数 (0-255, 真实手指典型范围) */
+#define PRESSURE_LIGHT  15   /* 刚接触时的轻压力 */
+#define PRESSURE_MIN    30   /* 按压下限 */
+#define PRESSURE_MAX    80   /* 按压上限 */
+#define PRESSURE_DEFAULT 55  /* D/M 命令默认压力 */
+
+/* 触摸面积参数 (模拟指腹接触面) */
+#define TOUCH_MAJOR_MIN 7
+#define TOUCH_MAJOR_MAX 11
+#define TOUCH_MINOR_MIN 5
+#define TOUCH_MINOR_MAX 8
+
 /* ============================================================
  * Global state
  * ============================================================ */
@@ -84,8 +111,58 @@ static int    current_slot = 0;
 static int    touch_down   = 0;
 static bool   module_ready = false;
 
-/* 随机抖动范围 (像素) */
-#define JITTER_RANGE 3
+/* AR(1) 时序相关抖动状态 (滑动时使用, 使连续帧抖动有记忆性) */
+static int    ar1_state_x = 0;
+static int    ar1_state_y = 0;
+
+/* ============================================================
+ * Random humanization helpers
+ * ============================================================ */
+
+/*
+ * 高斯分布随机数 (CLT近似)
+ *
+ * 三个均匀分布[-1000,1000]求和, sigma ~= 1414
+ * 返回值: gaussian_rand(sigma) ~ N(0, sigma)
+ *
+ * 为什么不用 Box-Muller: 内核空间避免浮点运算,
+ * CLT近似在 sigma < 20 时精度足够 (3个样本即可)
+ */
+static int gaussian_rand(int sigma)
+{
+    int sum;
+    sum =  (prandom_u32() % 2001) - 1000;
+    sum += (prandom_u32() % 2001) - 1000;
+    sum += (prandom_u32() % 2001) - 1000;
+    /* sum 范围 [-3000, 3000], sigma ~= 1414 */
+    return (sum * sigma) / 1414;
+}
+
+/*
+ * 高斯抖动 (独立, 无记忆)
+ * 用于点击等单次操作
+ */
+static int jitter(int val, int range)
+{
+    return val + gaussian_rand(range);
+}
+
+/*
+ * AR(1) 时序相关抖动
+ * 模型: x[n] = 0.7 * x[n-1] + w[n]
+ *   其中 w[n] ~ N(0, range)
+ *   0.7 系数控制记忆性 (越大越平滑)
+ *
+ * 用于滑动轨迹, 使相邻帧的偏移有连续性,
+ * 而非每帧独立跳变 (真实手指颤动有惯性)
+ */
+static int ar1_jitter(int val, int range, int *state)
+{
+    int w = gaussian_rand(range);
+    /* x[n] = 0.7 * x[n-1] + w[n], 整数运算: *7/10 */
+    *state = (*state * 7) / 10 + w;
+    return val + *state;
+}
 
 /* ============================================================
  * Touch protocol helpers
@@ -93,11 +170,15 @@ static bool   module_ready = false;
 
 /*
  * 发送单点触摸事件。
- * slim=0 时带触面数据（TOUCH_MAJOR/MINOR），
- * 真机 FTS 驱动也上报这些字段。
+ * pressure: 按压力度 0-255 (若设备支持 ABS_MT_PRESSURE 则上报)
+ * first=true 时带 tracking ID 分配
+ *
+ * 触面 TOUCH_MAJOR/MINOR 每帧随机化, 模拟指腹面积自然变化
  */
-static void fts_report_abs(int x, int y, int slot, bool first)
+static void fts_report_abs(int x, int y, int slot, bool first, int pressure)
 {
+    int touch_major, touch_minor;
+
     if (!fts_input_dev)
         return;
 
@@ -105,25 +186,38 @@ static void fts_report_abs(int x, int y, int slot, bool first)
     input_event(fts_input_dev, EV_ABS, ABS_MT_SLOT, slot);
 
     if (first) {
-        /* 首次触摸：分配 tracking ID */
+        /* 首次触摸: 分配 tracking ID */
         input_event(fts_input_dev, EV_ABS, ABS_MT_TRACKING_ID,
                     (slot + 1) * 100 + 0x45);
     }
 
-    /* 坐标 (屏幕坐标 × 比例 → 触控坐标) */
+    /* 坐标 (屏幕坐标 x 比例 -> 触控坐标) */
     input_event(fts_input_dev, EV_ABS, ABS_MT_POSITION_X,
                 clamp(x * X_SCALE, 0, X_MAX));
     input_event(fts_input_dev, EV_ABS, ABS_MT_POSITION_Y,
                 clamp(y * Y_SCALE, 0, Y_MAX));
 
-    /* 触面: 模拟手指接触面 ~8-10 单位 */
-    input_event(fts_input_dev, EV_ABS, ABS_MT_TOUCH_MAJOR, 8);
-    input_event(fts_input_dev, EV_ABS, ABS_MT_TOUCH_MINOR, 6);
+    /* 触面: 随机化手指接触面 (模拟指腹面积变化) */
+    touch_major = TOUCH_MAJOR_MIN +
+                  prandom_u32() % (TOUCH_MAJOR_MAX - TOUCH_MAJOR_MIN + 1);
+    touch_minor = TOUCH_MINOR_MIN +
+                  prandom_u32() % (TOUCH_MINOR_MAX - TOUCH_MINOR_MIN + 1);
+    input_event(fts_input_dev, EV_ABS, ABS_MT_TOUCH_MAJOR, touch_major);
+    input_event(fts_input_dev, EV_ABS, ABS_MT_TOUCH_MINOR, touch_minor);
 
     /* 方向角 (竖直) */
     input_event(fts_input_dev, EV_ABS, ABS_MT_ORIENTATION, 0);
 
-    /* FTS 驱动不支持 ABS_MT_PRESSURE, 跳过 */
+    /*
+     * 压力: 若 absinfo 已注册则上报
+     * FTS 驱动原生不支持 ABS_MT_PRESSURE, 在 fts_finder_connect()
+     * 中通过 hack 补充了 absinfo, 此处条件检查后上报
+     */
+    if (fts_input_dev->absinfo &&
+        test_bit(ABS_MT_PRESSURE, fts_input_dev->absbit)) {
+        input_event(fts_input_dev, EV_ABS, ABS_MT_PRESSURE,
+                    clamp(pressure, 0, 255));
+    }
 }
 
 static void fts_report_sync(void)
@@ -133,7 +227,7 @@ static void fts_report_sync(void)
     input_event(fts_input_dev, EV_SYN, SYN_REPORT, 0);
 }
 
-static void fts_touch_down(int x, int y)
+static void fts_touch_down(int x, int y, int pressure)
 {
     touch_down = 1;
 
@@ -141,17 +235,17 @@ static void fts_touch_down(int x, int y)
     input_event(fts_input_dev, EV_KEY, BTN_TOUCH, 1);
     input_event(fts_input_dev, EV_KEY, BTN_TOOL_FINGER, 1);
 
-    fts_report_abs(x, y, current_slot, true);
+    fts_report_abs(x, y, current_slot, true, pressure);
     fts_report_sync();
 }
 
-static void fts_touch_move(int x, int y)
+static void fts_touch_move(int x, int y, int pressure)
 {
     if (!touch_down) {
-        fts_touch_down(x, y);
+        fts_touch_down(x, y, pressure);
         return;
     }
-    fts_report_abs(x, y, current_slot, false);
+    fts_report_abs(x, y, current_slot, false, pressure);
     fts_report_sync();
 }
 
@@ -174,41 +268,75 @@ static void fts_touch_up(void)
     current_slot = (current_slot + 1) % MAX_SLOTS;
 }
 
-/* 添加随机微抖动 (模拟真人手指自然颤抖) */
-static int jitter(int val, int range)
-{
-    int r = (prandom_u32() % (range * 2 + 1)) - range;
-    return val + r;
-}
+/* ============================================================
+ * High-level touch actions (humanized)
+ * ============================================================ */
 
 /*
- * 模拟真人的触摸流程：按下 → 短留 → 抬起
+ * 拟人化点击: 四阶段压力渐变
+ *
+ * 真实手指点击的压力曲线:
+ *   轻触(15-25) -> 渐增(30-45) -> 稳定(50-65) -> 渐减(20-30) -> 抬起
+ *
+ * 相比 v1.0 的 "按下->等50-120ms->抬起" 两帧,
+ * v2.0 发出 4 帧事件, 每帧压力不同, 模拟力度渐入渐出
  */
 static void do_tap(int x, int y)
 {
+    int hold_ms;
+
     if (!module_ready || !fts_input_dev)
         return;
 
+    /* 高斯抖动坐标 (人手不可能精确点到同一像素) */
     x = jitter(x, JITTER_RANGE);
     y = jitter(y, JITTER_RANGE);
 
-    fts_touch_down(x, y);
+    /* Phase 1: 轻触 (手指刚接触屏幕, 压力低) */
+    fts_touch_down(x, y, PRESSURE_LIGHT + prandom_u32() % 10);
+    usleep_range_state(8000, 16000, 2);  /* 8-16ms */
 
-    /* 模拟按压延迟 50-120ms */
-    usleep_range_state(50000, 120000, 2);
+    /* Phase 2: 渐增 (手指用力压下, 压力上升) */
+    fts_touch_move(x, y, PRESSURE_MIN + prandom_u32() % 15);
+    usleep_range_state(8000, 16000, 2);  /* 8-16ms */
+
+    /* Phase 3: 保持 (稳定按压, 主体停留时间) */
+    fts_touch_move(x, y,
+                   (PRESSURE_MIN + PRESSURE_MAX) / 2 + prandom_u32() % 10);
+    hold_ms = 30 + prandom_u32() % 60;  /* 30-90ms 保持 */
+    usleep_range_state(hold_ms * 1000, (hold_ms + 30) * 1000, 2);
+
+    /* Phase 4: 渐减 (手指准备抬起, 压力回落) */
+    fts_touch_move(x, y, PRESSURE_LIGHT + prandom_u32() % 10);
+    usleep_range_state(4000, 8000, 2);  /* 4-8ms */
 
     fts_touch_up();
+
+    /* 总时长: 50-130ms (与 v1.0 的 50-120ms 一致) */
 }
 
 /*
- * 整数贝塞尔曲线滑动（无浮点运算）
- * 使用二次贝塞尔: B(t) = (1-t)^2*P0 + 2(1-t)t*Pc + t^2*P1
- * 用固定点整数: 乘 1000 运算, 最后除 1000000
+ * 拟人化滑动: 三次贝塞尔 + Smoothstep缓动 + AR(1)抖动 + 压力变化
+ *
+ * 改进点:
+ *   1. 三次贝塞尔 (2个控制点) 替代二次贝塞尔 (1个控制点)
+ *      B(t) = (1-t)^3*P0 + 3(1-t)^2*t*P1 + 3(1-t)*t^2*P2 + t^3*P3
+ *   2. Smoothstep 缓动: t' = 3t^2 - 2t^3
+ *      使滑动有加速->匀速->减速的三阶段特征
+ *   3. AR(1) 抖动: 相邻帧偏移有记忆性, 模拟肌肉颤动惯性
+ *   4. 压力变化: 起始渐增->中段稳定->末尾渐减
+ *
+ * 整数定点运算, 无浮点 (内核空间)
  */
 static void do_swipe(int x1, int y1, int x2, int y2, int duration_ms)
 {
-    int steps, i, ti, t2, mt, mt2, px, py;
-    int cx, cy;
+    int steps, i;
+    int cx1, cy1, cx2, cy2;     /* 三次贝塞尔的两个控制点 */
+    int px, py;
+    int progress, base_p, swipe_p;
+    int t_raw, t2, t_eased;     /* Smoothstep 缓动参数 */
+    int ti, mt, mt2, mt3, t2b, t3b;  /* 贝塞尔系数 */
+    int b0, b1, b2, b3;
 
     if (!module_ready || !fts_input_dev)
         return;
@@ -217,36 +345,88 @@ static void do_swipe(int x1, int y1, int x2, int y2, int duration_ms)
     if (duration_ms > 5000)
         duration_ms = 5000;
 
-    steps = duration_ms / 8;  /* ~8ms/frame */
+    steps = duration_ms / 8;  /* ~8ms/frame ~ 125Hz */
     if (steps < 4)
         steps = 4;
     if (steps > 200)
         steps = 200;
 
-    /* 控制点：起点和终点中间加入微小偏移 */
-    cx = (x1 + x2) / 2 + (prandom_u32() % 21 - 10);
-    cy = (y1 + y2) / 2 + (prandom_u32() % 21 - 10);
+    /*
+     * 三次贝塞尔的两个控制点
+     * P1 在路径 1/3 处, P2 在 2/3 处, 各加 +-20px 随机偏移
+     * 两个控制点独立偏移, 产生比二次贝塞尔更自然的弧线
+     */
+    cx1 = x1 + (x2 - x1) / 3 + (prandom_u32() % 41 - 20);
+    cy1 = y1 + (y2 - y1) / 3 + (prandom_u32() % 41 - 20);
+    cx2 = x1 + 2 * (x2 - x1) / 3 + (prandom_u32() % 41 - 20);
+    cy2 = y1 + 2 * (y2 - y1) / 3 + (prandom_u32() % 41 - 20);
 
-    fts_touch_down(x1, y1);
+    /* 重置 AR(1) 状态 (每次滑动从零开始) */
+    ar1_state_x = 0;
+    ar1_state_y = 0;
+
+    /* 起始: 轻触 */
+    fts_touch_down(x1, y1, PRESSURE_LIGHT + prandom_u32() % 10);
     usleep_range_state(20000, 40000, 2);
 
     for (i = 1; i <= steps; i++) {
-        /* ti = i/steps * 1000 (固定点整数, 范围 0-1000) */
-        ti = (i * 1000) / steps;
-        /* mt = 1000 - ti */
+        /*
+         * Smoothstep 缓动: S(t) = 3t^2 - 2t^3
+         * 使 t 在起始和结束处变化慢 (加速/减速段),
+         * 中段变化快 (匀速段), 模拟三阶段运动
+         */
+        t_raw = (i * 1000) / steps;       /* [0, 1000] */
+        t2 = t_raw * t_raw / 1000;        /* t^2, [0, 1000] */
+        t_eased = 3 * t2 - 2 * t2 * t_raw / 1000;  /* S(t), [0, 1000] */
+
+        /*
+         * 三次贝塞尔系数 (定点整数, scale=1000)
+         * b0 = (1-t)^3, b1 = 3(1-t)^2*t, b2 = 3(1-t)*t^2, b3 = t^3
+         * b0+b1+b2+b3 = 1000 (=1.0)
+         */
+        ti = t_eased;
         mt = 1000 - ti;
-        /* t2 = ti^2 / 1000, mt2 = mt^2 / 1000 */
-        t2 = (ti * ti) / 1000;
-        mt2 = (mt * mt) / 1000;
+        mt2 = mt * mt / 1000;
+        mt3 = mt2 * mt / 1000;
+        t2b = ti * ti / 1000;
+        t3b = t2b * ti / 1000;
 
-        /* B(t) = (mt2*P0 + 2*mt*ti*Pc + t2*P1) / 1000000 */
-        px = (mt2 * x1 + 2 * mt * ti / 1000 * cx + t2 * x2) / 1000;
-        py = (mt2 * y1 + 2 * mt * ti / 1000 * cy + t2 * y2) / 1000;
+        b0 = mt3;                        /* (1-t)^3 * 1000 */
+        b1 = 3 * mt2 * ti / 1000;        /* 3(1-t)^2*t * 1000 */
+        b2 = 3 * mt * t2b / 1000;        /* 3(1-t)*t^2 * 1000 */
+        b3 = t3b;                        /* t^3 * 1000 */
 
-        px = jitter(px, 2);
-        py = jitter(py, 2);
+        /* B(t) = (b0*P0 + b1*P1 + b2*P2 + b3*P3) / 1000 */
+        px = (int)((s64)(b0 * x1 + b1 * cx1 + b2 * cx2 + b3 * x2) / 1000);
+        py = (int)((s64)(b0 * y1 + b1 * cy1 + b2 * cy2 + b3 * y2) / 1000);
 
-        fts_touch_move(px, py);
+        /* AR(1) 相关抖动 (连续帧有记忆性, 模拟肌肉颤动) */
+        px = ar1_jitter(px, 2, &ar1_state_x);
+        py = ar1_jitter(py, 2, &ar1_state_y);
+
+        /*
+         * 滑动压力变化: 三段式
+         *   0-15%:  渐增 (手指按压下去)
+         *   15-85%: 稳定 (主体滑动, 略有波动)
+         *   85-100%: 渐减 (手指准备抬起)
+         */
+        progress = (i * 100) / steps;
+        if (progress < 15) {
+            base_p = PRESSURE_LIGHT +
+                     (PRESSURE_MIN - PRESSURE_LIGHT) * progress / 15;
+        } else if (progress > 85) {
+            base_p = PRESSURE_LIGHT +
+                     (PRESSURE_MIN - PRESSURE_LIGHT) * (100 - progress) / 15;
+        } else {
+            base_p = (PRESSURE_MIN + PRESSURE_MAX) / 2;
+        }
+        swipe_p = base_p + gaussian_rand(5);
+        if (swipe_p < PRESSURE_LIGHT)
+            swipe_p = PRESSURE_LIGHT;
+        if (swipe_p > PRESSURE_MAX + 10)
+            swipe_p = PRESSURE_MAX + 10;
+
+        fts_touch_move(px, py, swipe_p);
         usleep_range_state(6000, 10000, 2);
     }
 
@@ -285,14 +465,16 @@ static ssize_t touch_write(struct file *file, const char __user *buf,
             do_tap(x, y);
         break;
 
-    case 'D': /* Down: D x y */
+    case 'D': /* Down: D x y (使用默认压力) */
         if (sscanf(kbuf, "D %d %d", &x, &y) == 2)
-            fts_touch_down(jitter(x, 2), jitter(y, 2));
+            fts_touch_down(jitter(x, 2), jitter(y, 2),
+                           PRESSURE_DEFAULT + gaussian_rand(5));
         break;
 
-    case 'M': /* Move: M x y */
+    case 'M': /* Move: M x y (使用默认压力) */
         if (sscanf(kbuf, "M %d %d", &x, &y) == 2)
-            fts_touch_move(jitter(x, 2), jitter(y, 2));
+            fts_touch_move(jitter(x, 2), jitter(y, 2),
+                           PRESSURE_DEFAULT + gaussian_rand(5));
         break;
 
     case 'U': /* Up */
@@ -327,7 +509,7 @@ static ssize_t touch_read(struct file *file, char __user *buf,
         return 0;
 
     if (module_ready && fts_input_dev)
-        msg = "OK ready fts\n";
+        msg = "OK ready fts v2\n";
     else if (fts_input_dev)
         msg = "INIT fts_found\n";
     else
@@ -349,7 +531,7 @@ static int touch_open(struct inode *inode, struct file *file)
 
 static int touch_release(struct inode *inode, struct file *file)
 {
-    /* 安全：如果还有触摸保持，强制释放 */
+    /* 安全: 如果还有触摸保持, 强制释放 */
     if (touch_down) {
         pr_warn("[touch_inject] closing while touch still down, releasing\n");
         fts_touch_up();
@@ -366,7 +548,7 @@ static const struct file_operations touch_fops = {
 };
 
 /* ============================================================
- * Input handler — 自动找到 FTS 的 input_dev
+ * Input handler -- 自动找到 FTS 的 input_dev
  * ============================================================ */
 
 static int fts_finder_connect(struct input_handler *handler,
@@ -382,9 +564,33 @@ static int fts_finder_connect(struct input_handler *handler,
                 dev->absinfo ? dev->absinfo[ABS_MT_POSITION_X].maximum : -1,
                 dev->absinfo ? dev->absinfo[ABS_MT_POSITION_Y].maximum : -1);
 
+        /*
+         * Hack: 补充 ABS_MT_PRESSURE 轴支持
+         *
+         * FTS 驱动未注册 ABS_MT_PRESSURE, 但 Android MotionEvent
+         * 可读取压力值用于反检测。直接修改 input_dev 的 absinfo
+         * 和 absbit, 使后续 input_event() 发送压力不被内核丢弃。
+         *
+         * 安全性: 仅添加新轴, 不修改已有轴; absinfo 已由 FTS
+         * 驱动分配 (因有 POSITION_X/Y), 直接写入即可。
+         */
+        if (dev->absinfo) {
+            if (!test_bit(ABS_MT_PRESSURE, dev->absbit)) {
+                dev->absinfo[ABS_MT_PRESSURE].minimum = 0;
+                dev->absinfo[ABS_MT_PRESSURE].maximum = 255;
+                dev->absinfo[ABS_MT_PRESSURE].fuzz = 0;
+                dev->absinfo[ABS_MT_PRESSURE].flat = 0;
+                dev->absinfo[ABS_MT_PRESSURE].resolution = 0;
+                __set_bit(ABS_MT_PRESSURE, dev->absbit);
+                pr_info("[touch_inject] Added ABS_MT_PRESSURE axis (0-255)\n");
+            } else {
+                pr_info("[touch_inject] ABS_MT_PRESSURE already supported\n");
+            }
+        }
+
         if (!module_ready) {
             module_ready = true;
-            pr_info("[touch_inject] Module ready for injection.\n");
+            pr_info("[touch_inject] Module ready for injection (v2.0).\n");
         }
     }
     return 0;
@@ -420,10 +626,12 @@ static int __init touch_inject_init(void)
     int ret;
 
     pr_info("[touch_inject] ====================================\n");
-    pr_info("[touch_inject] Loading on Xiaomi 13 (fuxi)\n");
+    pr_info("[touch_inject] Loading v2.0 (humanized) on Xiaomi 13 (fuxi)\n");
     pr_info("[touch_inject] Kernel: %s\n", UTS_RELEASE);
+    pr_info("[touch_inject] Features: gaussian jitter, AR(1), pressure gradient,\n");
+    pr_info("[touch_inject]   cubic bezier, smoothstep easing\n");
 
-    /* 步骤1: 注册 input handler，自动匹配 fts 设备 */
+    /* 步骤1: 注册 input handler, 自动匹配 fts 设备 */
     ret = input_register_handler(&fts_finder_handler);
     if (ret) {
         pr_err("[touch_inject] FAILED to register input handler: %d\n", ret);
@@ -433,7 +641,7 @@ static int __init touch_inject_init(void)
     if (!fts_input_dev) {
         pr_warn("[touch_inject] WARNING: No 'fts' device found immediately\n");
         pr_warn("[touch_inject] It may appear later (driver not loaded yet?)\n");
-        /* 不返回错误，因为 FTS 驱动可能在这个模块之后加载 */
+        /* 不返回错误, 因为 FTS 驱动可能在这个模块之后加载 */
     }
 
     /* 步骤2: 创建字符设备 /dev/touch_inject */
@@ -473,7 +681,7 @@ static int __init touch_inject_init(void)
             MAJOR(dev_num));
     pr_info("[touch_inject] FTS device: %s\n",
             fts_input_dev ? "CONNECTED" : "NOT FOUND (will retry)");
-    pr_info("[touch_inject] Module loaded successfully.\n");
+    pr_info("[touch_inject] Module v2.0 loaded successfully.\n");
     pr_info("[touch_inject] ====================================\n");
 
     return 0;
@@ -504,7 +712,7 @@ static void __exit touch_inject_exit(void)
     input_unregister_handler(&fts_finder_handler);
     fts_input_dev = (void *)0;
 
-    pr_info("[touch_inject] Module unloaded.\n");
+    pr_info("[touch_inject] Module v2.0 unloaded.\n");
 }
 
 module_init(touch_inject_init);
