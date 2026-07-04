@@ -1,7 +1,9 @@
 /*
- * touch_inject.c — FTS 触控注入内核模块 (拟人化增强版 v2.0)
+ * touch_inject.c — FTS 触控注入内核模块 (拟人化增强版 v2.1)
  *
  * 目标: 小米13 (fuxi), GKI 5.15.178, STM FTS 触控IC
+ *   内核 uname -r: 5.15.178-android13-8-g362d545d31a5
+ *   GKI vermagic:  5.15.78 (系统所有 .ko 均用此简化版本号)
  *
  * 工作原理:
  *   1. 通过 input_handler 自动匹配名为 "fts" 的 input_dev
@@ -16,6 +18,13 @@
  *   5. 多帧压力渐变点击 -- 按下渐入->保持->抬起渐出, 非瞬变
  *   6. 三次贝塞尔曲线滑动 -- 2个控制点, 比二次更自然
  *   7. Smoothstep缓动 -- 三阶段运动模型(加速->匀速->减速)
+ *
+ * v2.1 工程修复 (不改协议, 不改拟人化算法):
+ *   1. touch_fops.owner = THIS_MODULE  (修复 use-after-free 崩溃风险)
+ *   2. input_handler 正确创建 input_handle (修复悬垂指针, disconnect 生效)
+ *   3. sscanf 返回4时 dur 初始化默认值 (修复未定义行为)
+ *   4. tracking ID 全局递增 (符合 Type-B 协议, 避免固定模式)
+ *   5. (void*)0 统一为 NULL (代码风格)
  *
  * 协议格式 (全部 ASCII, 以换行结束) -- 与 v1.0 完全兼容:
  *   T x y              -- tap (点击, 内部多帧压力渐变)
@@ -51,11 +60,13 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("buddy");
-MODULE_DESCRIPTION("STM FTS touch injector for Xiaomi 13 (fuxi) - humanized v2.0");
-MODULE_VERSION("2.0");
+MODULE_DESCRIPTION("STM FTS touch injector for Xiaomi 13 (fuxi) - humanized v2.1");
+MODULE_VERSION("2.1");
 /* Manually set name and vermagic (normally added by modpost) */
 MODULE_INFO(name, "touch_inject");
-/* vermagic must match phone's kernel: 5.15.78 from existing modules */
+/* vermagic: GKI 5.15.78 是系统所有 .ko 的统一简化版本号
+ * 实际内核 uname -r = 5.15.178-android13-8-g362d545d31a5
+ * 经核验 /vendor_dlkm/lib/modules/*.ko 的 vermagic 均为 5.15.78 */
 MODULE_INFO(vermagic, "5.15.78 SMP preempt mod_unload modversions aarch64");
 
 /* ============================================================
@@ -114,6 +125,11 @@ static bool   module_ready = false;
 /* AR(1) 时序相关抖动状态 (滑动时使用, 使连续帧抖动有记忆性) */
 static int    ar1_state_x = 0;
 static int    ar1_state_y = 0;
+
+/* v2.1: tracking ID 全局递增计数器 (符合 Type-B 协议)
+ * 真人每次触摸的 tracking ID 必须唯一且递增,
+ * 固定值模式容易被行为分析检测 */
+static int    tracking_id_counter = 0;
 
 /* ============================================================
  * Random humanization helpers
@@ -186,9 +202,11 @@ static void fts_report_abs(int x, int y, int slot, bool first, int pressure)
     input_event(fts_input_dev, EV_ABS, ABS_MT_SLOT, slot);
 
     if (first) {
-        /* 首次触摸: 分配 tracking ID */
+        /* v2.1: tracking ID 全局递增 (符合 Type-B 协议)
+         * 原 v2.0 用固定值 (slot+1)*100+0x45, 模式高度规律,
+         * 同一 slot 抬起后再次按下会复用相同 ID, 易被检测 */
         input_event(fts_input_dev, EV_ABS, ABS_MT_TRACKING_ID,
-                    (slot + 1) * 100 + 0x45);
+                    tracking_id_counter++);
     }
 
     /* 坐标 (屏幕坐标 x 比例 -> 触控坐标) */
@@ -443,7 +461,8 @@ static ssize_t touch_write(struct file *file, const char __user *buf,
 {
     char kbuf[BUF_SIZE];
     char cmd;
-    int x, y, x2, y2, dur;
+    /* v2.1: dur 初始化默认值, 避免 sscanf 返回4时读取未初始化变量 (UB) */
+    int x, y, x2, y2, dur = 500;
 
     if (!module_ready || !fts_input_dev)
         return -ENODEV;
@@ -509,7 +528,7 @@ static ssize_t touch_read(struct file *file, char __user *buf,
         return 0;
 
     if (module_ready && fts_input_dev)
-        msg = "OK ready fts v2\n";
+        msg = "OK ready fts v2.1\n";
     else if (fts_input_dev)
         msg = "INIT fts_found\n";
     else
@@ -540,7 +559,10 @@ static int touch_release(struct inode *inode, struct file *file)
 }
 
 static const struct file_operations touch_fops = {
-    .owner   = NULL,
+    /* v2.1: owner 必须为 THIS_MODULE
+     * 原 v2.0 为 NULL, 导致模块被打开使用时引用计数不加,
+     * rmmod 会直接卸载正在使用的模块, 触发 use-after-free 内核崩溃 */
+    .owner   = THIS_MODULE,
     .open    = touch_open,
     .release = touch_release,
     .read    = touch_read,
@@ -549,57 +571,103 @@ static const struct file_operations touch_fops = {
 
 /* ============================================================
  * Input handler -- 自动找到 FTS 的 input_dev
+ *
+ * v2.1 修复: 正确创建 input_handle
+ *   原 v2.0/v1.0 的 connect 回调只保存 dev 指针就返回0,
+ *   没有调用 input_register_handle(), 导致:
+ *     1. disconnect 永远不被触发 (死代码)
+ *     2. FTS 设备热拔时 fts_input_dev 变悬垂指针
+ *   v2.1 在 connect 里分配 input_handle 并注册,
+ *   disconnect 里注销并释放, 符合 input 子系统约定.
  * ============================================================ */
+
+/* 保存我们的 handle 指针, 用于 disconnect 时清理 */
+static struct input_handle *fts_handle = NULL;
 
 static int fts_finder_connect(struct input_handler *handler,
                               struct input_dev *dev,
                               const struct input_device_id *id)
 {
-    if (dev->name && strcmp(dev->name, "fts") == 0) {
-        fts_input_dev = dev;
-        pr_info("[touch_inject] FTS input_dev captured: %px\n", dev);
-        pr_info("[touch_inject]   phys=%s\n",
-                dev->phys ? dev->phys : "(null)");
-        pr_info("[touch_inject]   ABS_X: 0..%d ABS_Y: 0..%d\n",
-                dev->absinfo ? dev->absinfo[ABS_MT_POSITION_X].maximum : -1,
-                dev->absinfo ? dev->absinfo[ABS_MT_POSITION_Y].maximum : -1);
+    struct input_handle *handle;
+    int ret;
 
-        /*
-         * Hack: 补充 ABS_MT_PRESSURE 轴支持
-         *
-         * FTS 驱动未注册 ABS_MT_PRESSURE, 但 Android MotionEvent
-         * 可读取压力值用于反检测。直接修改 input_dev 的 absinfo
-         * 和 absbit, 使后续 input_event() 发送压力不被内核丢弃。
-         *
-         * 安全性: 仅添加新轴, 不修改已有轴; absinfo 已由 FTS
-         * 驱动分配 (因有 POSITION_X/Y), 直接写入即可。
-         */
-        if (dev->absinfo) {
-            if (!test_bit(ABS_MT_PRESSURE, dev->absbit)) {
-                dev->absinfo[ABS_MT_PRESSURE].minimum = 0;
-                dev->absinfo[ABS_MT_PRESSURE].maximum = 255;
-                dev->absinfo[ABS_MT_PRESSURE].fuzz = 0;
-                dev->absinfo[ABS_MT_PRESSURE].flat = 0;
-                dev->absinfo[ABS_MT_PRESSURE].resolution = 0;
-                __set_bit(ABS_MT_PRESSURE, dev->absbit);
-                pr_info("[touch_inject] Added ABS_MT_PRESSURE axis (0-255)\n");
-            } else {
-                pr_info("[touch_inject] ABS_MT_PRESSURE already supported\n");
-            }
-        }
+    /* 只匹配名为 "fts" 的设备 */
+    if (!dev->name || strcmp(dev->name, "fts") != 0)
+        return -ENODEV;  /* 不匹配, 明确拒绝 */
 
-        if (!module_ready) {
-            module_ready = true;
-            pr_info("[touch_inject] Module ready for injection (v2.0).\n");
+    /* 已有 handle 则跳过 (避免重复) */
+    if (fts_handle) {
+        pr_warn("[touch_inject] FTS already connected, skip\n");
+        return 0;
+    }
+
+    pr_info("[touch_inject] FTS input_dev captured: %px\n", dev);
+    pr_info("[touch_inject]   phys=%s\n",
+            dev->phys ? dev->phys : "(null)");
+    pr_info("[touch_inject]   ABS_X: 0..%d ABS_Y: 0..%d\n",
+            dev->absinfo ? dev->absinfo[ABS_MT_POSITION_X].maximum : -1,
+            dev->absinfo ? dev->absinfo[ABS_MT_POSITION_Y].maximum : -1);
+
+    /*
+     * Hack: 补充 ABS_MT_PRESSURE 轴支持
+     *
+     * FTS 驱动未注册 ABS_MT_PRESSURE, 但 Android MotionEvent
+     * 可读取压力值用于反检测。直接修改 input_dev 的 absinfo
+     * 和 absbit, 使后续 input_event() 发送压力不被内核丢弃。
+     */
+    if (dev->absinfo) {
+        if (!test_bit(ABS_MT_PRESSURE, dev->absbit)) {
+            dev->absinfo[ABS_MT_PRESSURE].minimum = 0;
+            dev->absinfo[ABS_MT_PRESSURE].maximum = 255;
+            dev->absinfo[ABS_MT_PRESSURE].fuzz = 0;
+            dev->absinfo[ABS_MT_PRESSURE].flat = 0;
+            dev->absinfo[ABS_MT_PRESSURE].resolution = 0;
+            __set_bit(ABS_MT_PRESSURE, dev->absbit);
+            pr_info("[touch_inject] Added ABS_MT_PRESSURE axis (0-255)\n");
+        } else {
+            pr_info("[touch_inject] ABS_MT_PRESSURE already supported\n");
         }
     }
+
+    /* v2.1: 分配并注册 input_handle
+     * 注意: 用 kmalloc+memset 替代 kzalloc, 因为 Termux 编译环境中
+     * kzalloc 是 inline 函数, 实际解析为 __kmalloc, 不需要单独的 CRC */
+    handle = kmalloc(sizeof(*handle), GFP_KERNEL | __GFP_ZERO);
+    if (!handle) {
+        pr_err("[touch_inject] FAILED to alloc input_handle\n");
+        return -ENOMEM;
+    }
+
+    handle->dev = dev;
+    handle->handler = handler;
+    handle->name = "touch_inject";
+
+    ret = input_register_handle(handle);
+    if (ret) {
+        pr_err("[touch_inject] FAILED input_register_handle: %d\n", ret);
+        kfree(handle);
+        return ret;
+    }
+
+    fts_handle = handle;
+    fts_input_dev = dev;
+
+    if (!module_ready) {
+        module_ready = true;
+        pr_info("[touch_inject] Module ready for injection (v2.1).\n");
+    }
+
     return 0;
 }
 
 static void fts_finder_disconnect(struct input_handle *handle)
 {
-    if (handle->dev == fts_input_dev) {
+    /* v2.1: 正确注销 handle, 清理悬垂指针 */
+    if (handle == fts_handle) {
         pr_warn("[touch_inject] FTS device disconnecting!\n");
+        input_unregister_handle(handle);
+        kfree(handle);
+        fts_handle = NULL;
         fts_input_dev = NULL;
         module_ready = false;
     }
@@ -626,10 +694,11 @@ static int __init touch_inject_init(void)
     int ret;
 
     pr_info("[touch_inject] ====================================\n");
-    pr_info("[touch_inject] Loading v2.0 (humanized) on Xiaomi 13 (fuxi)\n");
+    pr_info("[touch_inject] Loading v2.1 (humanized+fixed) on Xiaomi 13 (fuxi)\n");
     pr_info("[touch_inject] Kernel: %s\n", UTS_RELEASE);
     pr_info("[touch_inject] Features: gaussian jitter, AR(1), pressure gradient,\n");
     pr_info("[touch_inject]   cubic bezier, smoothstep easing\n");
+    pr_info("[touch_inject] v2.1 fixes: owner, input_handle, dur init, tracking ID\n");
 
     /* 步骤1: 注册 input handler, 自动匹配 fts 设备 */
     ret = input_register_handler(&fts_finder_handler);
@@ -681,7 +750,7 @@ static int __init touch_inject_init(void)
             MAJOR(dev_num));
     pr_info("[touch_inject] FTS device: %s\n",
             fts_input_dev ? "CONNECTED" : "NOT FOUND (will retry)");
-    pr_info("[touch_inject] Module v2.0 loaded successfully.\n");
+    pr_info("[touch_inject] Module v2.1 loaded successfully.\n");
     pr_info("[touch_inject] ====================================\n");
 
     return 0;
@@ -705,14 +774,21 @@ static void __exit touch_inject_exit(void)
 
     module_ready = false;
 
+    /* v2.1: 清理 input_handle (如果还存在的) */
+    if (fts_handle) {
+        input_unregister_handle(fts_handle);
+        kfree(fts_handle);
+        fts_handle = NULL;
+    }
+
     device_destroy(touch_class, dev_num);
     class_destroy(touch_class);
     cdev_del(&touch_cdev);
     unregister_chrdev_region(dev_num, 1);
     input_unregister_handler(&fts_finder_handler);
-    fts_input_dev = (void *)0;
+    fts_input_dev = NULL;  /* v2.1: (void*)0 统一为 NULL */
 
-    pr_info("[touch_inject] Module v2.0 unloaded.\n");
+    pr_info("[touch_inject] Module v2.1 unloaded.\n");
 }
 
 module_init(touch_inject_init);
