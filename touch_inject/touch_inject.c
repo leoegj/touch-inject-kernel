@@ -64,9 +64,10 @@ MODULE_DESCRIPTION("STM FTS touch injector for Xiaomi 13 (fuxi) - humanized v2.1
 MODULE_VERSION("2.1");
 /* Manually set name and vermagic (normally added by modpost) */
 MODULE_INFO(name, "touch_inject");
-/* vermagic: GKI 5.15.78 是系统所有 .ko 的统一简化版本号
+/* vermagic: GKI 5.15.78 是系统所有 ko 模块的统一简化版本号
  * 实际内核 uname -r = 5.15.178-android13-8-g362d545d31a5
- * 经核验 /vendor_dlkm/lib/modules/*.ko 的 vermagic 均为 5.15.78 */
+ * 经核验 vendor_dlkm 下所有模块的 vermagic 均为 5.15.78
+ */
 MODULE_INFO(vermagic, "5.15.78 SMP preempt mod_unload modversions aarch64");
 
 /* ============================================================
